@@ -26,11 +26,7 @@ class AuthController extends ApiBaseController
             $this->api->respond_error('Invalid email or password.', 401);
         }
         if ($user['role'] === 'resident' && empty($user['email_verified_at'])) {
-            $this->db->raw(
-                'UPDATE users SET email_verified_at = NOW(), updated_at = NOW() WHERE id = ?',
-                [$user['id']]
-            );
-            $user['email_verified_at'] = date('Y-m-d H:i:s');
+            $this->api->respond_error('Please verify your email address before signing in.', 403);
         }
         if ((int) $user['is_active'] !== 1) {
             if ($user['role'] !== 'resident') {
@@ -86,6 +82,9 @@ class AuthController extends ApiBaseController
         if (!is_string($password) || strlen($password) < 8 || $password !== ($input['password_confirmation'] ?? null)) {
             $this->api->respond_error('Passwords must match and contain at least 8 characters.', 422);
         }
+        if (!SmtpMailer::isConfigured()) {
+            $this->api->respond_error('Email verification is not configured. Please try again later.', 503);
+        }
         $existingUser = $this->db->raw(
             'SELECT id FROM users WHERE email = ? LIMIT 1',
             [$email]
@@ -94,13 +93,14 @@ class AuthController extends ApiBaseController
             $this->api->respond_error('An account with this email already exists.', 409);
         }
 
+        $verificationCode = str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT);
         if (!$this->db->transaction()) {
             $this->api->respond_error('Could not start account registration. Please try again.', 500);
         }
         try {
             $this->db->raw(
                 'INSERT INTO users (name, email, phone, password, password_is_set, role, is_active, email_verified_at, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, 1, ?, 1, NOW(), NOW(), NOW())',
+                 VALUES (?, ?, ?, ?, 1, ?, 1, NULL, NOW(), NOW())',
                 [$name, $email, $phone ?: null, password_hash($password, PASSWORD_DEFAULT), 'resident']
             );
             $user = $this->getUserByEmail($email);
@@ -116,6 +116,11 @@ class AuthController extends ApiBaseController
                     !array_key_exists('email_enabled', $input) || !empty($input['email_enabled']) ? 1 : 0,
                 ]
             );
+            $this->db->raw(
+                'INSERT INTO email_verification_tokens (user_id, code_hash, expires_at, sent_at, attempts)
+                 VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 15 MINUTE), NOW(), 0)',
+                [$user['id'], $this->hashOneTimeCode($verificationCode)]
+            );
             $this->db->commit();
         } catch (Throwable $error) {
             $this->db->roll_back();
@@ -126,21 +131,373 @@ class AuthController extends ApiBaseController
             $this->api->respond_error('Could not complete account registration. Please try again.', 500);
         }
 
-        $emailSent = true;
+        $emailSent = false;
         try {
-            SmtpMailer::sendWelcomeEmail($email, $name);
+            SmtpMailer::sendEmailVerificationCode($email, $name, $verificationCode);
+            $emailSent = true;
         } catch (Throwable $error) {
-            $emailSent = false;
-            error_log('Could not send account welcome email for user ' . $user['id'] . ': ' . $error->getMessage());
+            error_log('Could not send account verification email for user ' . $user['id'] . ': ' . $error->getMessage());
+            try {
+                $this->db->raw('DELETE FROM email_verification_tokens WHERE user_id = ?', [$user['id']]);
+            } catch (Throwable $cleanupError) {
+                error_log('Could not remove unsent verification code for user ' . $user['id'] . ': ' . $cleanupError->getMessage());
+            }
         }
 
         $this->respondSuccess(
-            ['email' => $email, 'welcome_email_sent' => $emailSent],
+            ['email' => $email, 'verification_email_sent' => $emailSent],
             $emailSent
-                ? 'Account created. Check your email for a welcome message.'
-                : 'Account created, but the welcome email could not be sent.',
+                ? 'Account created. Enter the verification code sent to your email.'
+                : 'Account created, but the verification email could not be sent. Request a new code to continue.',
             201
         );
+    }
+
+    public function resendEmailVerification()
+    {
+        $this->api->require_method('POST');
+        $input = $this->api->body();
+        $email = is_string($input['email'] ?? null) ? strtolower(trim($input['email'])) : '';
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 150) {
+            $this->api->respond_error('Enter a valid email address.', 422);
+        }
+        if (!SmtpMailer::isConfigured()) {
+            $this->api->respond_error('Email verification is not configured. Please try again later.', 503);
+        }
+
+        $user = $this->db->raw(
+            'SELECT id, name, email, email_verified_at
+             FROM users WHERE email = ? AND role = ? LIMIT 1',
+            [$email, 'resident']
+        )->fetch(PDO::FETCH_ASSOC);
+        if (!$user || !empty($user['email_verified_at'])) {
+            $this->respondSuccess(
+                ['requested' => true],
+                'If this address belongs to an unverified resident account, a code will be sent.'
+            );
+        }
+
+        $existingRequest = $this->db->raw(
+            'SELECT sent_at, (sent_at > DATE_SUB(NOW(), INTERVAL 60 SECOND)) AS sent_recently
+             FROM email_verification_tokens WHERE user_id = ? LIMIT 1',
+            [$user['id']]
+        )->fetch(PDO::FETCH_ASSOC);
+        if ($existingRequest && (int) $existingRequest['sent_recently'] === 1) {
+            $this->respondSuccess(
+                ['requested' => true],
+                'If this address belongs to an unverified resident account, a code will be sent.'
+            );
+        }
+
+        $code = str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+        if (!$this->db->transaction()) {
+            $this->api->respond_error('Could not request a verification code. Please try again.', 500);
+        }
+        try {
+            $this->db->raw(
+                'INSERT INTO email_verification_tokens (user_id, code_hash, expires_at, sent_at, attempts)
+                 VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 15 MINUTE), NOW(), 0)
+                 ON DUPLICATE KEY UPDATE code_hash = VALUES(code_hash), expires_at = VALUES(expires_at),
+                    sent_at = VALUES(sent_at), attempts = 0',
+                [$user['id'], $this->hashOneTimeCode($code)]
+            );
+            $this->db->commit();
+        } catch (Throwable $error) {
+            $this->db->roll_back();
+            error_log('Could not create email verification code for user ' . $user['id'] . ': ' . $error->getMessage());
+            $this->api->respond_error('Could not request a verification code. Please try again.', 500);
+        }
+
+        try {
+            SmtpMailer::sendEmailVerificationCode($email, (string) $user['name'], $code);
+        } catch (Throwable $error) {
+            error_log('Could not resend account verification email for user ' . $user['id'] . ': ' . $error->getMessage());
+            try {
+                $this->db->raw('DELETE FROM email_verification_tokens WHERE user_id = ?', [$user['id']]);
+            } catch (Throwable $cleanupError) {
+                error_log('Could not remove unsent verification code for user ' . $user['id'] . ': ' . $cleanupError->getMessage());
+            }
+        }
+
+        $this->respondSuccess(
+            ['requested' => true],
+            'If this address belongs to an unverified resident account, a code will be sent.'
+        );
+    }
+
+    public function verifyEmail()
+    {
+        $this->api->require_method('POST');
+        $input = $this->api->body();
+        $email = is_string($input['email'] ?? null) ? strtolower(trim($input['email'])) : '';
+        $code = $input['code'] ?? '';
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 150
+            || !is_string($code) || preg_match('/\A[0-9]{6}\z/', $code) !== 1) {
+            $this->api->respond_error('Enter a valid email address and 6-digit verification code.', 422);
+        }
+        if (!$this->db->transaction()) {
+            $this->api->respond_error('Could not verify the email. Please try again.', 500);
+        }
+
+        $verifiedUser = null;
+        try {
+            $user = $this->db->raw(
+                'SELECT id, name, email, phone, role, is_active, auth_version, email_verified_at, profile_photo, created_at
+                 FROM users WHERE email = ? AND role = ? LIMIT 1 FOR UPDATE',
+                [$email, 'resident']
+            )->fetch(PDO::FETCH_ASSOC);
+            if ($user && empty($user['email_verified_at'])) {
+                $token = $this->db->raw(
+                    'SELECT code_hash, attempts, (expires_at > NOW()) AS is_valid
+                     FROM email_verification_tokens WHERE user_id = ? LIMIT 1 FOR UPDATE',
+                    [$user['id']]
+                )->fetch(PDO::FETCH_ASSOC);
+                if ($token && (int) $token['is_valid'] === 1 && (int) $token['attempts'] < 5
+                    && hash_equals((string) $token['code_hash'], $this->hashOneTimeCode($code))) {
+                    $this->db->raw(
+                        'UPDATE users SET email_verified_at = NOW(), updated_at = NOW() WHERE id = ?',
+                        [$user['id']]
+                    );
+                    $this->db->raw('DELETE FROM email_verification_tokens WHERE user_id = ?', [$user['id']]);
+                    $verifiedUser = $this->db->raw(
+                        'SELECT id, name, email, phone, role, is_active, auth_version, email_verified_at, profile_photo, created_at
+                         FROM users WHERE id = ? LIMIT 1',
+                        [$user['id']]
+                    )->fetch(PDO::FETCH_ASSOC);
+                } elseif ($token) {
+                    $attempts = (int) $token['attempts'] + 1;
+                    if ($attempts >= 5 || (int) $token['is_valid'] !== 1) {
+                        $this->db->raw('DELETE FROM email_verification_tokens WHERE user_id = ?', [$user['id']]);
+                    } else {
+                        $this->db->raw(
+                            'UPDATE email_verification_tokens SET attempts = ? WHERE user_id = ?',
+                            [$attempts, $user['id']]
+                        );
+                    }
+                }
+            }
+            $this->db->commit();
+        } catch (Throwable $error) {
+            $this->db->roll_back();
+            throw $error;
+        }
+
+        if (!$verifiedUser) {
+            $this->api->respond_error('The verification code is invalid or expired. Request a new code and try again.', 422);
+        }
+
+        $welcomeEmailSent = true;
+        try {
+            SmtpMailer::sendWelcomeEmail($email, (string) $verifiedUser['name']);
+        } catch (Throwable $error) {
+            $welcomeEmailSent = false;
+            error_log('Could not send welcome email for verified user ' . $verifiedUser['id'] . ': ' . $error->getMessage());
+        }
+
+        $tokens = $this->api->issue_tokens([
+            'id' => $verifiedUser['id'],
+            'role' => $verifiedUser['role'],
+            'auth_version' => (int) $verifiedUser['auth_version'],
+        ]);
+        $this->actor = $verifiedUser;
+        $this->audit('login', 'auth', $verifiedUser['id'], 'Signed in after verifying email.');
+        $authenticatedUser = $this->userWithSettings($verifiedUser);
+
+        $this->respondSuccess(
+            [
+                'email_verified' => true,
+                'welcome_email_sent' => $welcomeEmailSent,
+                'user' => $authenticatedUser,
+                'tokens' => $tokens,
+            ],
+            $welcomeEmailSent
+                ? 'Email verified successfully. You are now signed in.'
+                : 'Email verified successfully, but the welcome email could not be sent. You are now signed in.'
+        );
+    }
+
+    public function requestPasswordReset()
+    {
+        $this->api->require_method('POST');
+        $input = $this->api->body();
+        $email = is_string($input['email'] ?? null) ? strtolower(trim($input['email'])) : '';
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 150) {
+            $this->api->respond_error('Enter a valid email address.', 422);
+        }
+        if (!SmtpMailer::isConfigured()) {
+            $this->api->respond_error('Password reset email is not configured. Please try again later.', 503);
+        }
+
+        $genericMessage = 'If an account exists for that email, a password reset code will be sent.';
+        $user = $this->db->raw(
+            'SELECT id, name, email FROM users WHERE email = ? AND role = ? LIMIT 1',
+            [$email, 'resident']
+        )->fetch(PDO::FETCH_ASSOC);
+        if (!$user) {
+            $this->respondSuccess(['requested' => true], $genericMessage);
+        }
+
+        $existingRequest = $this->db->raw(
+            'SELECT sent_at, (sent_at > DATE_SUB(NOW(), INTERVAL 60 SECOND)) AS sent_recently
+             FROM password_reset_tokens WHERE user_id = ? LIMIT 1',
+            [$user['id']]
+        )->fetch(PDO::FETCH_ASSOC);
+        if ($existingRequest && (int) $existingRequest['sent_recently'] === 1) {
+            $this->respondSuccess(['requested' => true], $genericMessage);
+        }
+
+        $code = str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+        if (!$this->db->transaction()) {
+            $this->api->respond_error('Could not request a password reset. Please try again.', 500);
+        }
+        try {
+            $this->db->raw(
+                'INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, sent_at, attempts)
+                 VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 15 MINUTE), NOW(), 0)
+                 ON DUPLICATE KEY UPDATE token_hash = VALUES(token_hash), expires_at = VALUES(expires_at),
+                    sent_at = VALUES(sent_at), attempts = 0',
+                [$user['id'], $this->hashOneTimeCode($code)]
+            );
+            $this->db->commit();
+        } catch (Throwable $error) {
+            $this->db->roll_back();
+            error_log('Could not create password reset code for user ' . $user['id'] . ': ' . $error->getMessage());
+            $this->api->respond_error('Could not request a password reset. Please try again.', 500);
+        }
+
+        try {
+            SmtpMailer::sendPasswordResetCode($email, (string) $user['name'], $code);
+        } catch (Throwable $error) {
+            error_log('Could not send password reset email for user ' . $user['id'] . ': ' . $error->getMessage());
+            try {
+                $this->db->raw('DELETE FROM password_reset_tokens WHERE user_id = ?', [$user['id']]);
+            } catch (Throwable $cleanupError) {
+                error_log('Could not remove unsent password reset code for user ' . $user['id'] . ': ' . $cleanupError->getMessage());
+            }
+        }
+
+        $this->respondSuccess(['requested' => true], $genericMessage);
+    }
+
+    public function verifyPasswordResetCode()
+    {
+        $this->api->require_method('POST');
+        $input = $this->api->body();
+        $email = is_string($input['email'] ?? null) ? strtolower(trim($input['email'])) : '';
+        $code = $input['code'] ?? '';
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 150
+            || !is_string($code) || preg_match('/\A[0-9]{6}\z/', $code) !== 1) {
+            $this->api->respond_error('Enter a valid email address and 6-digit reset code.', 422);
+        }
+        if (!$this->db->transaction()) {
+            $this->api->respond_error('Could not verify the reset code. Please try again.', 500);
+        }
+
+        $codeValid = false;
+        try {
+            $user = $this->db->raw(
+                'SELECT id FROM users WHERE email = ? AND role = ? LIMIT 1 FOR UPDATE',
+                [$email, 'resident']
+            )->fetch(PDO::FETCH_ASSOC);
+            if ($user) {
+                $token = $this->db->raw(
+                    'SELECT token_hash, attempts, (expires_at > NOW()) AS is_valid
+                     FROM password_reset_tokens WHERE user_id = ? LIMIT 1 FOR UPDATE',
+                    [$user['id']]
+                )->fetch(PDO::FETCH_ASSOC);
+                if ($token && (int) $token['is_valid'] === 1 && (int) $token['attempts'] < 5
+                    && hash_equals((string) $token['token_hash'], $this->hashOneTimeCode($code))) {
+                    $codeValid = true;
+                } elseif ($token) {
+                    $attempts = (int) $token['attempts'] + 1;
+                    if ($attempts >= 5 || (int) $token['is_valid'] !== 1) {
+                        $this->db->raw('DELETE FROM password_reset_tokens WHERE user_id = ?', [$user['id']]);
+                    } else {
+                        $this->db->raw(
+                            'UPDATE password_reset_tokens SET attempts = ? WHERE user_id = ?',
+                            [$attempts, $user['id']]
+                        );
+                    }
+                }
+            }
+            $this->db->commit();
+        } catch (Throwable $error) {
+            $this->db->roll_back();
+            throw $error;
+        }
+
+        if (!$codeValid) {
+            $this->api->respond_error('The reset code is invalid or expired. Request a new code and try again.', 422);
+        }
+
+        $this->respondSuccess(['code_valid' => true], 'Reset code verified. Choose a new password.');
+    }
+
+    public function resetPassword()
+    {
+        $this->api->require_method('POST');
+        $input = $this->api->body();
+        $email = is_string($input['email'] ?? null) ? strtolower(trim($input['email'])) : '';
+        $code = $input['code'] ?? '';
+        $password = $input['password'] ?? null;
+        $confirmation = $input['password_confirmation'] ?? null;
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($email) > 150
+            || !is_string($code) || preg_match('/\A[0-9]{6}\z/', $code) !== 1) {
+            $this->api->respond_error('Enter a valid email address and 6-digit reset code.', 422);
+        }
+        if (!is_string($password) || strlen($password) < 8 || $password !== $confirmation) {
+            $this->api->respond_error('Passwords must match and contain at least 8 characters.', 422);
+        }
+        if (!$this->db->transaction()) {
+            $this->api->respond_error('Could not reset the password. Please try again.', 500);
+        }
+
+        $passwordReset = false;
+        try {
+            $user = $this->db->raw(
+                'SELECT id FROM users WHERE email = ? AND role = ? LIMIT 1 FOR UPDATE',
+                [$email, 'resident']
+            )->fetch(PDO::FETCH_ASSOC);
+            if ($user) {
+                $token = $this->db->raw(
+                    'SELECT token_hash, attempts, (expires_at > NOW()) AS is_valid
+                     FROM password_reset_tokens WHERE user_id = ? LIMIT 1 FOR UPDATE',
+                    [$user['id']]
+                )->fetch(PDO::FETCH_ASSOC);
+                if ($token && (int) $token['is_valid'] === 1 && (int) $token['attempts'] < 5
+                    && hash_equals((string) $token['token_hash'], $this->hashOneTimeCode($code))) {
+                    $this->db->raw(
+                        'UPDATE users SET password = ?, password_is_set = 1,
+                            auth_version = auth_version + 1, updated_at = NOW() WHERE id = ?',
+                        [password_hash($password, PASSWORD_DEFAULT), $user['id']]
+                    );
+                    $this->db->raw('DELETE FROM password_reset_tokens WHERE user_id = ?', [$user['id']]);
+                    $this->db->raw('DELETE FROM refresh_tokens WHERE user_id = ?', [$user['id']]);
+                    $this->audit('password_reset', 'users', $user['id'], 'Password reset with an email verification code.', $user['id']);
+                    $passwordReset = true;
+                } elseif ($token) {
+                    $attempts = (int) $token['attempts'] + 1;
+                    if ($attempts >= 5 || (int) $token['is_valid'] !== 1) {
+                        $this->db->raw('DELETE FROM password_reset_tokens WHERE user_id = ?', [$user['id']]);
+                    } else {
+                        $this->db->raw(
+                            'UPDATE password_reset_tokens SET attempts = ? WHERE user_id = ?',
+                            [$attempts, $user['id']]
+                        );
+                    }
+                }
+            }
+            $this->db->commit();
+        } catch (Throwable $error) {
+            $this->db->roll_back();
+            throw $error;
+        }
+
+        if (!$passwordReset) {
+            $this->api->respond_error('The reset code is invalid or expired. Request a new code and try again.', 422);
+        }
+
+        $this->respondSuccess(['password_reset' => true], 'Password reset successfully. You can now sign in.');
     }
 
     public function googleSignIn()
@@ -864,6 +1221,16 @@ class AuthController extends ApiBaseController
             $this->api->respond_error('A refresh token is required.', 400);
         }
         $this->api->refresh_access_token($refreshToken);
+    }
+
+    private function hashOneTimeCode($code)
+    {
+        $secret = (string) config_item('jwt_secret');
+        if ($secret === '') {
+            throw new RuntimeException('The JWT secret is not configured for one-time code hashing.');
+        }
+        $codeHashKey = hash_hmac('sha256', 'baco360-one-time-code-hash', $secret, true);
+        return hash_hmac('sha256', $code, $codeHashKey);
     }
 
     private function getUserByEmail($email)

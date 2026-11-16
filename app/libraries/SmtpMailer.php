@@ -54,6 +54,18 @@ class SmtpMailer
         self::sendEmail($recipient, 'Welcome to Baco360', $text, $html);
     }
 
+    public static function sendEmailVerificationCode($recipient, $name, $code)
+    {
+        self::sendCodeEmail(
+            $recipient,
+            $name,
+            $code,
+            'Verify your Baco360 email',
+            'Your Baco360 email verification code is:',
+            'If you did not create a Baco360 account, you can ignore this email.'
+        );
+    }
+
     public static function sendPasswordResetCode($recipient, $name, $code)
     {
         self::sendCodeEmail(
