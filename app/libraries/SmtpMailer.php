@@ -1,10 +1,19 @@
 <?php
 defined('PREVENT_DIRECT_ACCESS') OR exit('No direct script access allowed');
+require_once __DIR__ . '/GmailApiMailer.php';
 
 class SmtpMailer
 {
     public static function isConfigured()
     {
+        $mailer = (string) config_item('mail_mailer');
+        if ($mailer === 'gmail_api') {
+            return GmailApiMailer::isConfigured();
+        }
+        if ($mailer !== 'smtp') {
+            return false;
+        }
+
         $host = (string) config_item('mail_host');
         $port = (int) config_item('mail_port');
         $encryption = (string) config_item('mail_encryption');
@@ -34,16 +43,15 @@ class SmtpMailer
         );
     }
 
-    public static function sendVerificationCode($recipient, $name, $code)
+    public static function sendWelcomeEmail($recipient, $name)
     {
-        self::sendCodeEmail(
-            $recipient,
-            $name,
-            $code,
-            'Verify your Baco360 email',
-            'Your Baco360 email verification code is:',
-            'If you did not create an account, you can ignore this email.'
-        );
+        $safeName = htmlspecialchars($name, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $text = "Hello {$name},\n\nYour Baco360 account has been created successfully. You can now sign in and start using your account.\n\nIf you did not create this account, please secure your email account.";
+        $html = '<p>Hello ' . $safeName . ',</p>'
+            . '<p>Your Baco360 account has been created successfully. You can now sign in and start using your account.</p>'
+            . '<p>If you did not create this account, please secure your email account.</p>';
+
+        self::sendEmail($recipient, 'Welcome to Baco360', $text, $html);
     }
 
     public static function sendPasswordResetCode($recipient, $name, $code)
@@ -73,6 +81,10 @@ class SmtpMailer
 
     public static function sendEmail($recipient, $subject, $text, $html)
     {
+        if ((string) config_item('mail_mailer') === 'gmail_api') {
+            GmailApiMailer::sendEmail($recipient, $subject, $text, $html);
+            return;
+        }
         if (!self::isConfigured()) {
             throw new RuntimeException('SMTP email is not configured. Check the MAIL_* settings.');
         }

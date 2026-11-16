@@ -121,6 +121,9 @@ $config['mail_password'] = getenv('MAIL_PASSWORD') ?: '';
 $config['mail_encryption'] = strtolower((string) (getenv('MAIL_ENCRYPTION') ?: 'tls'));
 $config['mail_from_address'] = getenv('MAIL_FROM_ADDRESS') ?: '';
 $config['mail_from_name'] = getenv('MAIL_FROM_NAME') ?: 'Baco360';
+$config['gmail_api_client_id'] = getenv('GMAIL_API_CLIENT_ID') ?: '';
+$config['gmail_api_client_secret'] = getenv('GMAIL_API_CLIENT_SECRET') ?: '';
+$config['gmail_api_refresh_token'] = getenv('GMAIL_API_REFRESH_TOKEN') ?: '';
 $frontend_url = getenv('FRONTEND_URL');
 if (!$frontend_url && (getenv('APP_ENV') ?: 'development') === 'development') {
 	$frontend_url = 'http://localhost:5173';

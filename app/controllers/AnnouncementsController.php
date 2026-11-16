@@ -1,6 +1,7 @@
 <?php
 defined('PREVENT_DIRECT_ACCESS') OR exit('No direct script access allowed');
 require_once __DIR__ . '/ApiBaseController.php';
+require_once APP_DIR . 'libraries/SmtpMailer.php';
 
 class AnnouncementsController extends ApiBaseController
 {
@@ -229,10 +230,13 @@ class AnnouncementsController extends ApiBaseController
             if ($audience === 'specific_users') {
                 $idPlaceholders = implode(', ', array_fill(0, count($recipientIds), '?'));
                 $recipients = $this->db->raw(
-                    'SELECT id, name, email FROM users
-                     WHERE is_active = 1 AND role IN (' . $rolePlaceholders . ')
-                       AND id IN (' . $idPlaceholders . ')
-                     ORDER BY id',
+                    'SELECT u.id, u.name, u.email, u.email_verified_at,
+                            COALESCE(ns.email_enabled, 1) AS email_enabled
+                     FROM users u
+                     LEFT JOIN notification_settings ns ON ns.user_id = u.id
+                     WHERE u.is_active = 1 AND u.role IN (' . $rolePlaceholders . ')
+                       AND u.id IN (' . $idPlaceholders . ')
+                     ORDER BY u.id',
                     [...$targetRoles, ...$recipientIds]
                 )->fetchAll(PDO::FETCH_ASSOC);
                 if (count($recipients) !== count($recipientIds)) {
@@ -241,9 +245,12 @@ class AnnouncementsController extends ApiBaseController
                 }
             } else {
                 $recipients = $this->db->raw(
-                    'SELECT id, name, email FROM users
-                     WHERE is_active = 1 AND role IN (' . $rolePlaceholders . ')
-                     ORDER BY id',
+                    'SELECT u.id, u.name, u.email, u.email_verified_at,
+                            COALESCE(ns.email_enabled, 1) AS email_enabled
+                     FROM users u
+                     LEFT JOIN notification_settings ns ON ns.user_id = u.id
+                     WHERE u.is_active = 1 AND u.role IN (' . $rolePlaceholders . ')
+                     ORDER BY u.id',
                     $targetRoles
                 )->fetchAll(PDO::FETCH_ASSOC);
             }
@@ -289,6 +296,47 @@ class AnnouncementsController extends ApiBaseController
             error_log('Announcement ' . $announcementId . ' was prepared but its audit record could not be saved: ' . $error->getMessage());
         }
 
+        $emailRecipients = array_values(array_filter($recipients, function ($recipient) use ($actor) {
+            return (int) $recipient['email_enabled'] === 1
+                && !empty($recipient['email_verified_at'])
+                && (int) $recipient['id'] !== (int) $actor['id'];
+        }));
+        $emailDelivery = [
+            'configured' => SmtpMailer::isConfigured(),
+            'attempted' => 0,
+            'sent' => 0,
+            'failed' => 0,
+            'skipped' => count($recipients) - count($emailRecipients),
+        ];
+        if (!$emailDelivery['configured']) {
+            $emailDelivery['failed'] = count($emailRecipients);
+            if ($emailRecipients) {
+                error_log('Announcement ' . $announcementId . ' was published, but email delivery is not configured.');
+            }
+        } else {
+            foreach ($emailRecipients as $recipient) {
+                $emailDelivery['attempted']++;
+                $safeName = htmlspecialchars((string) $recipient['name'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+                $safeTitle = htmlspecialchars($title, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+                $safeMessage = nl2br(htmlspecialchars($message, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'));
+                $text = "Hello {$recipient['name']},\n\n{$title}\n\n{$message}";
+                $html = '<p>Hello ' . $safeName . ',</p><h2>' . $safeTitle . '</h2><p>'
+                    . $safeMessage . '</p><p>Baco360</p>';
+                try {
+                    SmtpMailer::sendEmail(
+                        $recipient['email'],
+                        'Baco360 announcement: ' . $title,
+                        $text,
+                        $html
+                    );
+                    $emailDelivery['sent']++;
+                } catch (Throwable $error) {
+                    $emailDelivery['failed']++;
+                    error_log('Could not send announcement ' . $announcementId . ' email to user ' . $recipient['id'] . ': ' . $error->getMessage());
+                }
+            }
+        }
+
         $this->respondSuccess([
             'announcement' => [
                 'id' => $announcementId,
@@ -302,6 +350,7 @@ class AnnouncementsController extends ApiBaseController
                 'archived_at' => null,
             ],
             'recipient_count' => count($recipients),
+            'email_delivery' => $emailDelivery,
             'audit_warning' => $auditWarning,
         ], 'Announcement published.', 201);
     }

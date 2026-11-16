@@ -183,11 +183,28 @@ $database['main'] = array(
 $config['base_url'] = 'http://localhost:3000/';
 ```
 
-### Email verification
+### Gmail API email delivery
 
-For Gmail, set `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`, and `SMTP_ENCRYPTION=starttls` in `baco360backend/.env`. Set `SMTP_USERNAME` and `EMAIL_FROM` to the same Gmail address, and set `SMTP_PASSWORD` to a Google App Password (not the regular Gmail password). App Passwords require 2-Step Verification. Keep these credentials on the backend and never put them in the frontend `.env`.
+The backend uses Google's PHP API client (`google/apiclient`) to send registration verification codes and announcement emails. Run `composer install` from `baco360backend` to install it.
 
-Run the backend migrations to create `email_verification_tokens` before enabling registration. New residents receive a six-digit verification code after registration. Codes expire after 15 minutes, and resend requests are limited to one per minute.
+1. Enable the Gmail API in Google Cloud and configure the OAuth consent screen for the Gmail account that will send Baco360 email. Grant the `https://www.googleapis.com/auth/gmail.send` scope and add the sender as a test user while the consent screen is in Testing.
+2. Create an OAuth client and obtain an offline refresh token authorized for the Gmail send scope. Keep the refresh token private; do not use the frontend Google Sign-In client ID as a substitute.
+3. Configure these backend-only values in `baco360backend/.env`:
+
+   ```dotenv
+   MAIL_MAILER=gmail_api
+   MAIL_FROM_ADDRESS=sender@example.com
+   MAIL_FROM_NAME=Baco360
+   GMAIL_API_CLIENT_ID=
+   GMAIL_API_CLIENT_SECRET=
+   GMAIL_API_REFRESH_TOKEN=
+   ```
+
+`MAIL_FROM_ADDRESS` must be the authorized Gmail mailbox or one of its configured send-as aliases. To use SMTP instead, set `MAIL_MAILER=smtp` and configure the existing `MAIL_HOST`, `MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD`, and `MAIL_ENCRYPTION` values. Keep all mail credentials on the backend.
+
+New resident accounts require email verification before password sign-in. Codes expire after 15 minutes, resend requests are limited to one per minute, and five incorrect attempts require a new code. Google Sign-In continues to verify the Google-asserted email. Announcements remain in-app and are also emailed to verified recipients with email notifications enabled; delivery failures do not undo a published announcement and are reported in its response.
+
+Ensure migrations `003_create_email_verification_tokens_table.php` and `023_align_email_verification_user_id.php` are applied before enabling registration. Review pending migrations before running the migration command on a shared or production database.
 
 ---
 

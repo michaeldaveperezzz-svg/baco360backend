@@ -1,0 +1,13 @@
+{
+  "name": "baco360/backend",
+  "description": "Baco360 PHP backend dependencies",
+  "type": "project",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.2",
+    "google/apiclient": "^2.20"
+  },
+  "config": {
+    "sort-packages": true
+  }
+}

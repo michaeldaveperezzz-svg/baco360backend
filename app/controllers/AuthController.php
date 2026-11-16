@@ -25,6 +25,13 @@ class AuthController extends ApiBaseController
         if (!$user || !password_verify($password, $user['password'])) {
             $this->api->respond_error('Invalid email or password.', 401);
         }
+        if ($user['role'] === 'resident' && empty($user['email_verified_at'])) {
+            $this->db->raw(
+                'UPDATE users SET email_verified_at = NOW(), updated_at = NOW() WHERE id = ?',
+                [$user['id']]
+            );
+            $user['email_verified_at'] = date('Y-m-d H:i:s');
+        }
         if ((int) $user['is_active'] !== 1) {
             if ($user['role'] !== 'resident') {
                 $this->api->respond_error('Account is inactive.', 403);
@@ -97,6 +104,9 @@ class AuthController extends ApiBaseController
                 [$name, $email, $phone ?: null, password_hash($password, PASSWORD_DEFAULT), 'resident']
             );
             $user = $this->getUserByEmail($email);
+            if (!$user) {
+                throw new RuntimeException('The newly registered user could not be loaded.');
+            }
             $this->db->raw(
                 'INSERT INTO notification_settings (user_id, sms_enabled, email_enabled, report_updates_enabled, resolution_updates_enabled)
                  VALUES (?, ?, ?, 1, 1)',
@@ -107,14 +117,28 @@ class AuthController extends ApiBaseController
                 ]
             );
             $this->db->commit();
-        } catch (Exception $error) {
+        } catch (Throwable $error) {
             $this->db->roll_back();
+            if ($error instanceof PDOException && $error->getCode() === '23000') {
+                $this->api->respond_error('An account with this email already exists.', 409);
+            }
             error_log('Could not complete account registration: ' . $error->getMessage());
             $this->api->respond_error('Could not complete account registration. Please try again.', 500);
         }
+
+        $emailSent = true;
+        try {
+            SmtpMailer::sendWelcomeEmail($email, $name);
+        } catch (Throwable $error) {
+            $emailSent = false;
+            error_log('Could not send account welcome email for user ' . $user['id'] . ': ' . $error->getMessage());
+        }
+
         $this->respondSuccess(
-            ['email' => $email, 'verification_required' => false],
-            'Account created. You can now sign in.',
+            ['email' => $email, 'welcome_email_sent' => $emailSent],
+            $emailSent
+                ? 'Account created. Check your email for a welcome message.'
+                : 'Account created, but the welcome email could not be sent.',
             201
         );
     }
@@ -146,6 +170,7 @@ class AuthController extends ApiBaseController
         }
 
         $user = $this->getUserByEmail($email);
+        $accountCreated = false;
         if (!$user && in_array($intent, ['sign_in', 'reactivate'], true)) {
             $this->api->respond_error('No Baco360 account is linked to this Google email. Create an account first.', 404);
         }
@@ -205,6 +230,7 @@ class AuthController extends ApiBaseController
                     [$user['id']]
                 );
                 $this->db->commit();
+                $accountCreated = true;
             } catch (Throwable $error) {
                 $this->db->roll_back();
                 $user = $this->getUserByEmail($email);
@@ -223,6 +249,17 @@ class AuthController extends ApiBaseController
             }
         }
 
+        $welcomeEmailSent = null;
+        if ($accountCreated) {
+            try {
+                SmtpMailer::sendWelcomeEmail($email, (string) $user['name']);
+                $welcomeEmailSent = true;
+            } catch (Throwable $error) {
+                $welcomeEmailSent = false;
+                error_log('Could not send Google account welcome email for user ' . $user['id'] . ': ' . $error->getMessage());
+            }
+        }
+
         $authVersion = $this->db->raw(
             'SELECT auth_version FROM users WHERE id = ? LIMIT 1',
             [$user['id']]
@@ -234,10 +271,15 @@ class AuthController extends ApiBaseController
         ]);
         $this->actor = $user;
         $this->audit('login', 'auth', $user['id'], 'Signed in with Google.');
-        $this->respondSuccess([
+        $response = [
             'user' => $this->userWithSettings($user),
             'tokens' => $tokens,
-        ], 'Google sign-in successful.');
+        ];
+        if ($accountCreated) {
+            $response['account_created'] = true;
+            $response['welcome_email_sent'] = $welcomeEmailSent;
+        }
+        $this->respondSuccess($response, 'Google sign-in successful.');
     }
 
     private function verifyGoogleIdToken($idToken, $clientId)
