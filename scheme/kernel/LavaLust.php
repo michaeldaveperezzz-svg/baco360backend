@@ -260,5 +260,19 @@ if (php_sapi_name() === 'cli') {
 
 if (empty($url)) $url = '/';
 
+if (($_GET['__route_debug'] ?? '') === '1') {
+    header('Content-Type: application/json');
+    echo json_encode([
+        'script_name' => $_SERVER['SCRIPT_NAME'] ?? '',
+        'request_uri' => $_SERVER['REQUEST_URI'] ?? '',
+        'base' => $base ?? null,
+        'path' => $path ?? null,
+        'url' => $url,
+        'method' => $method,
+        'route_defined' => $router->route_exists('api/website-content'),
+    ]);
+    exit;
+}
+
 $router->initiate($url, $method);
 ?>
