@@ -168,36 +168,204 @@ class UsersController extends ApiBaseController
     {
         $this->api->require_method('DELETE');
         $actor = $this->requireAdmin();
-        $user = $this->getUser($id);
-        if (!$user) $this->api->respond_error('User not found.', 404);
-        if ((int) $id === (int) $actor['id']) $this->api->respond_error('You cannot delete your own account.', 409);
-        if ($user['role'] === 'admin') {
-            $remaining = $this->db->raw(
-                'SELECT COUNT(*) AS total FROM users WHERE role = ? AND is_active = 1 AND id <> ?',
-                ['admin', $id]
-            )->fetch(PDO::FETCH_ASSOC);
-            if ((int) $remaining['total'] === 0) $this->api->respond_error('At least one active administrator must remain.', 409);
+        $input = $this->api->body();
+        $deleteLinkedReports = filter_var($input['delete_linked_reports'] ?? false, FILTER_VALIDATE_BOOLEAN);
+        if (!$this->db->transaction()) {
+            $this->api->respond_error('Could not delete the account. Please try again.', 500);
         }
 
-        $references = [
-            'reports' => 'resident_id',
-            'report_comments' => 'user_id',
-            'report_assignments' => 'staff_id',
-            'community_report_comments' => 'user_id',
-            'community_events' => 'created_by',
-        ];
-        foreach ($references as $table => $column) {
-            $count = $this->db->raw(
-                'SELECT COUNT(*) AS total FROM ' . $table . ' WHERE ' . $column . ' = ?',
+        $reportAttachmentPaths = [];
+        $profilePhoto = null;
+        $reportCount = 0;
+        try {
+            $user = $this->db->raw(
+                'SELECT id, role, is_active, profile_photo FROM users WHERE id = ? FOR UPDATE',
                 [$id]
             )->fetch(PDO::FETCH_ASSOC);
-            if ((int) $count['total'] > 0) {
-                $this->api->respond_error('This account has existing records. Deactivate it instead of deleting it.', 409);
+            if (!$user) {
+                $this->db->roll_back();
+                $this->api->respond_error('User not found.', 404);
+            }
+            if ((int) $id === (int) $actor['id']) {
+                $this->db->roll_back();
+                $this->api->respond_error('You cannot delete your own account.', 409);
+            }
+            if ($user['role'] === 'admin') {
+                $remaining = (int) $this->db->raw(
+                    'SELECT COUNT(*) FROM users WHERE role = ? AND is_active = 1 AND id <> ?',
+                    ['admin', $id]
+                )->fetchColumn();
+                if ($remaining === 0) {
+                    $this->db->roll_back();
+                    $this->api->respond_error('At least one active administrator must remain.', 409);
+                }
+            }
+
+            $reportIds = array_map('intval', $this->db->raw(
+                'SELECT id FROM reports WHERE resident_id = ? ORDER BY id FOR UPDATE',
+                [$id]
+            )->fetchAll(PDO::FETCH_COLUMN));
+            $reportCount = count($reportIds);
+            if ($reportCount > 0 && !$deleteLinkedReports) {
+                $this->db->roll_back();
+                $reportLabel = $reportCount === 1 ? 'report' : 'reports';
+                $this->api->respond([
+                    'error' => 'This account still has ' . $reportCount . ' ' . $reportLabel . '.',
+                    'status' => 409,
+                    'code' => 'USER_HAS_REPORTS',
+                    'data' => ['report_count' => $reportCount],
+                ], 409);
+            }
+
+            $assignmentCount = (int) $this->db->raw(
+                'SELECT COUNT(*) FROM report_assignments
+                 WHERE (staff_id = ? OR assigned_by = ?)
+                   AND report_id NOT IN (SELECT id FROM reports WHERE resident_id = ?)',
+                [$id, $id, $id]
+            )->fetchColumn();
+            if ($assignmentCount > 0) {
+                $this->db->roll_back();
+                $this->api->respond_error(
+                    'This account is linked to ' . $assignmentCount . ' report assignments on other reports. Deactivate it instead of deleting it.',
+                    409
+                );
+            }
+
+            foreach ([
+                'community_events' => ['created_by', 'community events'],
+                'announcements' => ['created_by', 'announcements'],
+            ] as $table => [$column, $recordLabel]) {
+                $count = (int) $this->db->raw(
+                    'SELECT COUNT(*) FROM ' . $table . ' WHERE ' . $column . ' = ?',
+                    [$id]
+                )->fetchColumn();
+                if ($count > 0) {
+                    $this->db->roll_back();
+                    $this->api->respond_error(
+                        'This account is linked to ' . $count . ' ' . $recordLabel . '. Deactivate it instead of deleting it.',
+                        409
+                    );
+                }
+            }
+
+            $this->db->raw('UPDATE report_comments SET user_id = NULL WHERE user_id = ?', [$id]);
+            $this->db->raw('UPDATE community_report_comments SET user_id = NULL WHERE user_id = ?', [$id]);
+            $profilePhoto = $user['profile_photo'] ?? null;
+            if ($reportIds) {
+                $reportPlaceholders = implode(',', array_fill(0, $reportCount, '?'));
+                $reportAttachmentPaths = $this->db->raw(
+                    'SELECT file_path FROM report_attachments WHERE report_id IN (' . $reportPlaceholders . ')',
+                    $reportIds
+                )->fetchAll(PDO::FETCH_COLUMN);
+                $reportFilter = ' IN (' . $reportPlaceholders . ')';
+
+                $this->db->raw(
+                    'DELETE FROM report_comment_attachments
+                     WHERE comment_id IN (
+                         SELECT id FROM report_comments WHERE report_id' . $reportFilter . '
+                     )',
+                    $reportIds
+                );
+                foreach ([
+                    'community_report_comments',
+                    'community_report_reactions',
+                    'report_comments',
+                    'report_assignments',
+                    'report_status_histories',
+                    'report_attachments',
+                    'user_notifications',
+                ] as $table) {
+                    $this->db->raw(
+                        'DELETE FROM ' . $table . ' WHERE report_id' . $reportFilter,
+                        $reportIds
+                    );
+                }
+                $this->db->raw(
+                    'DELETE FROM reports WHERE id IN (' . $reportPlaceholders . ')',
+                    $reportIds
+                );
+            }
+
+            $this->db->raw('DELETE FROM community_report_reactions WHERE user_id = ?', [$id]);
+            $this->db->raw('DELETE FROM email_verification_tokens WHERE user_id = ?', [$id]);
+            $this->db->raw('DELETE FROM password_reset_tokens WHERE user_id = ?', [$id]);
+            $this->db->raw('DELETE FROM user_contact_change_tokens WHERE user_id = ?', [$id]);
+            $this->db->raw('DELETE FROM notification_settings WHERE user_id = ?', [$id]);
+            $this->db->raw('DELETE FROM resident_profiles WHERE user_id = ?', [$id]);
+            $this->db->raw('DELETE FROM announcement_recipients WHERE user_id = ?', [$id]);
+            $this->db->raw('DELETE FROM user_notifications WHERE recipient_id = ?', [$id]);
+            $this->db->raw('UPDATE user_notifications SET actor_id = NULL WHERE actor_id = ?', [$id]);
+            $this->db->raw('DELETE FROM refresh_tokens WHERE user_id = ?', [$id]);
+            $this->db->raw('DELETE FROM users WHERE id = ?', [$id]);
+            $this->actor = $actor;
+            $this->audit(
+                'deleted',
+                'users',
+                $id,
+                $reportCount > 0
+                    ? 'Deleted user account ' . $id . ' and ' . $reportCount . ' linked report(s).'
+                    : 'Deleted user account ' . $id
+            );
+            if (!$this->db->commit()) {
+                throw new RuntimeException('Could not commit the account deletion.');
+            }
+        } catch (PDOException $error) {
+            $this->db->roll_back();
+            if ($error->getCode() === '23000') {
+                $this->api->respond_error(
+                    'This account still has linked records and cannot be deleted.',
+                    409
+                );
+            }
+            throw $error;
+        } catch (Throwable $error) {
+            $this->db->roll_back();
+            throw $error;
+        }
+
+        $attachmentsDeleted = $this->deleteStoredReportAttachments($reportAttachmentPaths);
+        $profilePhotoDeleted = $this->deleteStoredProfilePhoto($profilePhoto);
+        $cleanupWarning = null;
+        if (!$attachmentsDeleted || !$profilePhotoDeleted) {
+            $cleanupWarning = 'The account and reports were deleted, but some uploaded files could not be removed.';
+            error_log('Deleted user ' . $id . ' but could not remove all associated uploaded files.');
+        }
+        $this->respondSuccess(
+            $cleanupWarning === null ? null : ['cleanup_warning' => $cleanupWarning],
+            $reportCount > 0 ? 'User and linked reports deleted.' : 'User deleted.'
+        );
+    }
+
+    private function deleteStoredReportAttachments(array $paths)
+    {
+        $directory = realpath(ROOT_DIR . 'runtime/uploads/reports');
+        if ($directory === false) return true;
+
+        $allDeleted = true;
+        foreach ($paths as $path) {
+            if (!is_string($path) || $path === '' || basename($path) !== $path) {
+                $allDeleted = false;
+                continue;
+            }
+            $filePath = realpath($directory . DIRECTORY_SEPARATOR . $path);
+            if ($filePath === false) continue;
+            if (dirname($filePath) !== $directory || !unlink($filePath)) {
+                $allDeleted = false;
             }
         }
-        $this->db->raw('DELETE FROM users WHERE id = ?', [$id]);
-        $this->actor = $actor;
-        $this->audit('deleted', 'users', $id, 'Deleted user account ' . $id);
-        $this->respondSuccess(null, 'User deleted.');
+        return $allDeleted;
+    }
+
+    private function deleteStoredProfilePhoto($path)
+    {
+        if (!is_string($path) || preg_match('/\Aprofile-photos\/[a-f0-9]{32}\.(jpg|png|webp)\z/', $path) !== 1) {
+            return true;
+        }
+        $uploadsDirectory = realpath(ROOT_DIR . 'runtime/uploads');
+        if ($uploadsDirectory === false) return true;
+        $filePath = realpath($uploadsDirectory . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $path));
+        if ($filePath === false) return true;
+        if (dirname($filePath) !== realpath($uploadsDirectory . DIRECTORY_SEPARATOR . 'profile-photos')) return false;
+        return unlink($filePath);
     }
 }

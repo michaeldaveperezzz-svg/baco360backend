@@ -540,8 +540,9 @@ class ReportsController extends ApiBaseController
              WHERE h.report_id = ? ORDER BY h.changed_at, h.id',
             [$report['id']]
         )->fetchAll(PDO::FETCH_ASSOC);
-        $commentsSql = 'SELECT c.id, u.name AS user_name, c.comment, c.is_internal, c.created_at
-                        FROM report_comments c JOIN users u ON u.id = c.user_id
+        $commentsSql = 'SELECT c.id, COALESCE(u.name, \'Deleted account\') AS user_name,
+                               c.comment, c.is_internal, c.created_at
+                        FROM report_comments c LEFT JOIN users u ON u.id = c.user_id
                         WHERE c.report_id = ?';
         $commentValues = [$report['id']];
         if ($this->actor['role'] === 'resident') {

@@ -5,6 +5,9 @@ require_once APP_DIR . 'libraries/SmtpMailer.php';
 
 class AuthController extends ApiBaseController
 {
+    private const ONE_TIME_CODE_TTL_SECONDS = 900;
+    private const ONE_TIME_CODE_RESEND_DELAY_SECONDS = 60;
+
     public function login()
     {
         $this->api->require_method('POST');
@@ -86,10 +89,17 @@ class AuthController extends ApiBaseController
             $this->api->respond_error('Email verification is not configured. Please try again later.', 503);
         }
         $existingUser = $this->db->raw(
-            'SELECT id FROM users WHERE email = ? LIMIT 1',
+            'SELECT id, role, email_verified_at FROM users WHERE email = ? LIMIT 1',
             [$email]
         )->fetch(PDO::FETCH_ASSOC);
         if ($existingUser) {
+            if ($existingUser['role'] === 'resident' && empty($existingUser['email_verified_at'])) {
+                $this->api->respond([
+                    'error' => 'This account is already waiting for email verification.',
+                    'status' => 409,
+                    'code' => 'EMAIL_VERIFICATION_PENDING',
+                ], 409);
+            }
             $this->api->respond_error('An account with this email already exists.', 409);
         }
 
@@ -125,6 +135,17 @@ class AuthController extends ApiBaseController
         } catch (Throwable $error) {
             $this->db->roll_back();
             if ($error instanceof PDOException && $error->getCode() === '23000') {
+                $existingUser = $this->db->raw(
+                    'SELECT role, email_verified_at FROM users WHERE email = ? LIMIT 1',
+                    [$email]
+                )->fetch(PDO::FETCH_ASSOC);
+                if ($existingUser && $existingUser['role'] === 'resident' && empty($existingUser['email_verified_at'])) {
+                    $this->api->respond([
+                        'error' => 'This account is already waiting for email verification.',
+                        'status' => 409,
+                        'code' => 'EMAIL_VERIFICATION_PENDING',
+                    ], 409);
+                }
                 $this->api->respond_error('An account with this email already exists.', 409);
             }
             error_log('Could not complete account registration: ' . $error->getMessage());
@@ -145,7 +166,12 @@ class AuthController extends ApiBaseController
         }
 
         $this->respondSuccess(
-            ['email' => $email, 'verification_email_sent' => $emailSent],
+            [
+                'email' => $email,
+                'verification_email_sent' => $emailSent,
+                'expires_in_seconds' => $emailSent ? self::ONE_TIME_CODE_TTL_SECONDS : 0,
+                'resend_after_seconds' => $emailSent ? self::ONE_TIME_CODE_RESEND_DELAY_SECONDS : 0,
+            ],
             $emailSent
                 ? 'Account created. Enter the verification code sent to your email.'
                 : 'Account created, but the verification email could not be sent. Request a new code to continue.',
@@ -172,19 +198,21 @@ class AuthController extends ApiBaseController
         )->fetch(PDO::FETCH_ASSOC);
         if (!$user || !empty($user['email_verified_at'])) {
             $this->respondSuccess(
-                ['requested' => true],
+                ['requested' => true] + $this->codeTiming(),
                 'If this address belongs to an unverified resident account, a code will be sent.'
             );
         }
 
         $existingRequest = $this->db->raw(
-            'SELECT sent_at, (sent_at > DATE_SUB(NOW(), INTERVAL 60 SECOND)) AS sent_recently
+            'SELECT
+                GREATEST(0, TIMESTAMPDIFF(SECOND, NOW(), expires_at)) AS expires_in_seconds,
+                GREATEST(0, ' . self::ONE_TIME_CODE_RESEND_DELAY_SECONDS . ' - TIMESTAMPDIFF(SECOND, sent_at, NOW())) AS resend_after_seconds
              FROM email_verification_tokens WHERE user_id = ? LIMIT 1',
             [$user['id']]
         )->fetch(PDO::FETCH_ASSOC);
-        if ($existingRequest && (int) $existingRequest['sent_recently'] === 1) {
+        if ($existingRequest && (int) $existingRequest['resend_after_seconds'] > 0) {
             $this->respondSuccess(
-                ['requested' => true],
+                ['requested' => true] + $this->codeTiming($existingRequest),
                 'If this address belongs to an unverified resident account, a code will be sent.'
             );
         }
@@ -208,8 +236,10 @@ class AuthController extends ApiBaseController
             $this->api->respond_error('Could not request a verification code. Please try again.', 500);
         }
 
+        $emailSent = false;
         try {
             SmtpMailer::sendEmailVerificationCode($email, (string) $user['name'], $code);
+            $emailSent = true;
         } catch (Throwable $error) {
             error_log('Could not resend account verification email for user ' . $user['id'] . ': ' . $error->getMessage());
             try {
@@ -220,7 +250,10 @@ class AuthController extends ApiBaseController
         }
 
         $this->respondSuccess(
-            ['requested' => true],
+            ['requested' => true] + $this->codeTiming($emailSent ? null : [
+                'expires_in_seconds' => 0,
+                'resend_after_seconds' => 0,
+            ]),
             'If this address belongs to an unverified resident account, a code will be sent.'
         );
     }
@@ -334,16 +367,18 @@ class AuthController extends ApiBaseController
             [$email, 'resident']
         )->fetch(PDO::FETCH_ASSOC);
         if (!$user) {
-            $this->respondSuccess(['requested' => true], $genericMessage);
+            $this->respondSuccess(['requested' => true] + $this->codeTiming(), $genericMessage);
         }
 
         $existingRequest = $this->db->raw(
-            'SELECT sent_at, (sent_at > DATE_SUB(NOW(), INTERVAL 60 SECOND)) AS sent_recently
+            'SELECT
+                GREATEST(0, TIMESTAMPDIFF(SECOND, NOW(), expires_at)) AS expires_in_seconds,
+                GREATEST(0, ' . self::ONE_TIME_CODE_RESEND_DELAY_SECONDS . ' - TIMESTAMPDIFF(SECOND, sent_at, NOW())) AS resend_after_seconds
              FROM password_reset_tokens WHERE user_id = ? LIMIT 1',
             [$user['id']]
         )->fetch(PDO::FETCH_ASSOC);
-        if ($existingRequest && (int) $existingRequest['sent_recently'] === 1) {
-            $this->respondSuccess(['requested' => true], $genericMessage);
+        if ($existingRequest && (int) $existingRequest['resend_after_seconds'] > 0) {
+            $this->respondSuccess(['requested' => true] + $this->codeTiming($existingRequest), $genericMessage);
         }
 
         $code = str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT);
@@ -365,8 +400,10 @@ class AuthController extends ApiBaseController
             $this->api->respond_error('Could not request a password reset. Please try again.', 500);
         }
 
+        $emailSent = false;
         try {
             SmtpMailer::sendPasswordResetCode($email, (string) $user['name'], $code);
+            $emailSent = true;
         } catch (Throwable $error) {
             error_log('Could not send password reset email for user ' . $user['id'] . ': ' . $error->getMessage());
             try {
@@ -376,7 +413,13 @@ class AuthController extends ApiBaseController
             }
         }
 
-        $this->respondSuccess(['requested' => true], $genericMessage);
+        $this->respondSuccess(
+            ['requested' => true] + $this->codeTiming($emailSent ? null : [
+                'expires_in_seconds' => 0,
+                'resend_after_seconds' => 0,
+            ]),
+            $genericMessage
+        );
     }
 
     public function verifyPasswordResetCode()
@@ -1138,8 +1181,6 @@ class AuthController extends ApiBaseController
             }
             $this->db->raw('DELETE FROM user_notifications WHERE recipient_id = ?', [$actor['id']]);
             $this->db->raw('UPDATE user_notifications SET actor_id = NULL WHERE actor_id = ?', [$actor['id']]);
-            $this->db->raw('DELETE FROM notifications WHERE recipient_id = ?', [$actor['id']]);
-            $this->db->raw('UPDATE notifications SET actor_id = NULL WHERE actor_id = ?', [$actor['id']]);
             $this->db->raw('DELETE FROM refresh_tokens WHERE user_id = ?', [$actor['id']]);
             $this->db->raw('DELETE FROM users WHERE id = ?', [$actor['id']]);
             $this->db->commit();
@@ -1221,6 +1262,21 @@ class AuthController extends ApiBaseController
             $this->api->respond_error('A refresh token is required.', 400);
         }
         $this->api->refresh_access_token($refreshToken);
+    }
+
+    private function codeTiming($existingRequest = null)
+    {
+        if ($existingRequest) {
+            return [
+                'expires_in_seconds' => max(0, (int) $existingRequest['expires_in_seconds']),
+                'resend_after_seconds' => max(0, (int) $existingRequest['resend_after_seconds']),
+            ];
+        }
+
+        return [
+            'expires_in_seconds' => self::ONE_TIME_CODE_TTL_SECONDS,
+            'resend_after_seconds' => self::ONE_TIME_CODE_RESEND_DELAY_SECONDS,
+        ];
     }
 
     private function hashOneTimeCode($code)

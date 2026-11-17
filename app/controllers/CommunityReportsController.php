@@ -113,15 +113,14 @@ class CommunityReportsController extends ApiBaseController
         unset($attachment);
 
         $post['comments'] = $this->db->raw(
-            'SELECT id, comment, created_at
+            'SELECT id, CASE WHEN user_id IS NULL THEN ? ELSE ? END AS author, comment, created_at
              FROM community_report_comments WHERE report_id = ?
              ORDER BY created_at DESC, id DESC
              LIMIT 100',
-            [$reportId]
+            ['Deleted account', 'Resident', $reportId]
         )->fetchAll(PDO::FETCH_ASSOC);
         foreach ($post['comments'] as &$comment) {
             $comment['id'] = (int) $comment['id'];
-            $comment['author'] = 'Resident';
         }
         unset($comment);
 
@@ -139,14 +138,13 @@ class CommunityReportsController extends ApiBaseController
             [$reportId]
         )->fetchColumn();
         $comments = $this->db->raw(
-            'SELECT id, comment, created_at
+            'SELECT id, CASE WHEN user_id IS NULL THEN ? ELSE ? END AS author, comment, created_at
              FROM community_report_comments WHERE report_id = ?
              ORDER BY created_at DESC, id DESC LIMIT ' . $perPage . ' OFFSET ' . (($page - 1) * $perPage),
-            [$reportId]
+            ['Deleted account', 'Resident', $reportId]
         )->fetchAll(PDO::FETCH_ASSOC);
         foreach ($comments as &$comment) {
             $comment['id'] = (int) $comment['id'];
-            $comment['author'] = 'Resident';
         }
         unset($comment);
 
