@@ -235,7 +235,8 @@ class ReportsController extends ApiBaseController
         $values[] = $id;
         $this->db->raw('UPDATE reports SET ' . implode(', ', $fields) . ', updated_at = NOW() WHERE id = ?', $values);
 
-        if (isset($input['status']) && $input['status'] !== $row['status']) {
+        $statusChanged = isset($input['status']) && $input['status'] !== $row['status'];
+        if ($statusChanged) {
             $this->db->raw(
                 'INSERT INTO report_status_histories (report_id, changed_by, old_status, new_status, notes, changed_at)
                  VALUES (?, ?, ?, ?, ?, NOW())',
@@ -247,9 +248,101 @@ class ReportsController extends ApiBaseController
             $this->notifyRoles(['admin', 'staff'], $id, 'concern_updated', $notificationPriority, $actor['id']);
         } else {
             $this->notifyUser($row['resident_id'], $id, 'report_updated', $notificationPriority);
+            if ($statusChanged) {
+                $this->emailResidentReportStatusUpdate($id, $row, $row['status'], $input['status']);
+            }
         }
         $this->audit('updated', 'reports', $id, 'Updated report ' . $row['reference_number']);
         $this->respondSuccess($this->reportDetails($this->findReport($id)), 'Report updated.');
+    }
+
+    private function emailResidentReportStatusUpdate($reportId, array $report, $previousStatus, $newStatus)
+    {
+        try {
+            $resident = $this->getUser($report['resident_id']);
+            $settings = $this->getNotificationSettings($report['resident_id']);
+        } catch (Throwable $error) {
+            error_log('Could not find email recipient for report ' . $reportId . ': ' . $error->getMessage());
+            return;
+        }
+
+        if (!$resident || $resident['role'] !== 'resident' || (int) $resident['is_active'] !== 1
+            || empty($resident['email_verified_at'])
+            || (int) $settings['email_enabled'] !== 1
+            || (int) $settings['report_updates_enabled'] !== 1) {
+            return;
+        }
+        if (!GmailApiMailer::isConfigured()) {
+            error_log('Report ' . $reportId . ' status changed, but Gmail API email is not configured.');
+            return;
+        }
+
+        $reference = (string) $report['reference_number'];
+        $title = (string) $report['title'];
+        $previousStatusLabel = ucwords(str_replace('_', ' ', (string) $previousStatus));
+        $newStatusLabel = ucwords(str_replace('_', ' ', (string) $newStatus));
+        $updatedAt = date('F j, Y g:i A');
+        $frontendUrl = rtrim((string) config_item('frontend_url'), '/');
+        $reportUrl = $frontendUrl !== ''
+            ? $frontendUrl . '/?report=' . rawurlencode((string) $reportId)
+            : null;
+        if ($reportUrl === null) {
+            error_log('Report ' . $reportId . ' status email has no report link because FRONTEND_URL is not configured.');
+        }
+
+        $text = "Hello {$resident['name']},\n\nThe status of your report has changed.\n\n"
+            . "Reference: {$reference}\n"
+            . "Title: {$title}\n"
+            . "Previous status: {$previousStatusLabel}\n"
+            . "New status: {$newStatusLabel}\n"
+            . "Updated: {$updatedAt}\n\n"
+            . ($reportUrl !== null ? 'Open report in Baco360: ' . $reportUrl : 'Sign in to Baco360 to view your report.');
+        $safeName = htmlspecialchars((string) $resident['name'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safeReference = htmlspecialchars($reference, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safeTitle = htmlspecialchars($title, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safePreviousStatus = htmlspecialchars($previousStatusLabel, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safeNewStatus = htmlspecialchars($newStatusLabel, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safeUpdatedAt = htmlspecialchars($updatedAt, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $statusColors = [
+            'submitted' => ['#e9eef9', '#3f5f9a'],
+            'under_review' => ['#e9eef9', '#3f5f9a'],
+            'assigned' => ['#e9eef9', '#3f5f9a'],
+            'in_progress' => ['#e9eef9', '#3f5f9a'],
+            'resolved' => ['#e9f7ee', '#236449'],
+            'rejected' => ['#fff0ee', '#a33b37'],
+            'reopened' => ['#fff2cc', '#8a5d00'],
+        ];
+        [$statusBackground, $statusForeground] = $statusColors[$newStatus] ?? ['#edf1ff', '#354c91'];
+        $safeReportUrl = $reportUrl !== null
+            ? htmlspecialchars($reportUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+            : null;
+        $html = '<h2>Report status update</h2>'
+            . '<p>Hello ' . $safeName . ',</p>'
+            . '<p>The status of your report has changed.</p>'
+            . '<p><strong>Reference:</strong> ' . $safeReference . '<br>'
+            . '<strong>Title:</strong> ' . $safeTitle . '<br>'
+            . '<strong>Previous status:</strong> ' . $safePreviousStatus . '<br>'
+            . '<strong>New status:</strong> <span style="display:inline-block;padding:3px 8px;border-radius:12px;background:'
+            . $statusBackground . ';color:' . $statusForeground . ';font-weight:bold">'
+            . $safeNewStatus . '</span><br>'
+            . '<strong>Updated:</strong> ' . $safeUpdatedAt . '</p>'
+            . ($safeReportUrl !== null
+                ? '<p><a href="' . $safeReportUrl . '">Open report in Baco360</a></p>'
+                : '<p>Sign in to Baco360 to view your report.</p>');
+
+        try {
+            GmailApiMailer::sendEmail(
+                $resident['email'],
+                'Report status update',
+                $text,
+                $html
+            );
+        } catch (Throwable $error) {
+            error_log(
+                'Could not send report ' . $reportId . ' status email to resident '
+                . $resident['id'] . ': ' . $error->getMessage()
+            );
+        }
     }
 
     public function destroy($id)
