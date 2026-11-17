@@ -570,6 +570,33 @@ class AuthController extends ApiBaseController
         }
 
         $user = $this->getUserByEmail($email);
+        if ($intent === 'sign_up') {
+            if (!SmtpMailer::isConfigured()) {
+                $this->api->respond_error('Email verification is not configured. Please try again later.', 503);
+            }
+            if ($user && $user['role'] !== 'resident') {
+                $this->api->respond_error('An account already exists for this Google email. Please sign in instead.', 409);
+            }
+            if ($user && (int) $user['is_active'] !== 1) {
+                $this->api->respond_error('This resident account is inactive.', 403);
+            }
+            if ($user && !empty($user['email_verified_at'])) {
+                $this->api->respond_error('An account already exists for this Google email. Please sign in instead.', 409);
+            }
+            if (!$user) {
+                $user = $this->createGoogleSignupUser($email, $identity);
+            }
+
+            $verification = $this->startGoogleSignupVerification($user);
+            $this->respondSuccess([
+                'requires_email_verification' => true,
+                'email' => $email,
+                'verification_email_sent' => $verification['verification_email_sent'],
+                'expires_in_seconds' => $verification['expires_in_seconds'],
+                'resend_after_seconds' => $verification['resend_after_seconds'],
+            ], 'Enter the verification code sent to your Google email.', 202);
+        }
+
         $accountCreated = false;
         if (!$user && in_array($intent, ['sign_in', 'reactivate'], true)) {
             $this->api->respond_error('No Baco360 account is linked to this Google email. Create an account first.', 404);
@@ -680,6 +707,96 @@ class AuthController extends ApiBaseController
             $response['welcome_email_sent'] = $welcomeEmailSent;
         }
         $this->respondSuccess($response, 'Google sign-in successful.');
+    }
+
+    private function createGoogleSignupUser($email, array $identity)
+    {
+        if (!$this->db->transaction()) {
+            $this->api->respond_error('Could not start Google account registration. Please try again.', 500);
+        }
+
+        try {
+            $name = trim((string) ($identity['name'] ?? ''));
+            if ($name === '') $name = strstr($email, '@', true) ?: 'Baco360 Resident';
+            $name = substr($name, 0, 150);
+            $this->db->raw(
+                'INSERT INTO users (name, email, phone, password, password_is_set, role, is_active, email_verified_at, created_at, updated_at)
+                 VALUES (?, ?, NULL, ?, 0, ?, 1, NULL, NOW(), NOW())',
+                [$name, $email, password_hash(bin2hex(random_bytes(32)), PASSWORD_DEFAULT), 'resident']
+            );
+            $user = $this->getUserByEmail($email);
+            if (!$user) {
+                throw new RuntimeException('Google account was created but could not be loaded.');
+            }
+            $this->db->raw(
+                'INSERT INTO notification_settings (user_id, sms_enabled, email_enabled, report_updates_enabled, resolution_updates_enabled)
+                 VALUES (?, 0, 1, 1, 1)',
+                [$user['id']]
+            );
+            $this->db->commit();
+            return $user;
+        } catch (Throwable $error) {
+            $this->db->roll_back();
+            if ($error instanceof PDOException && $error->getCode() === '23000') {
+                $existingUser = $this->getUserByEmail($email);
+                if ($existingUser) return $existingUser;
+            }
+            error_log('Could not create Google sign-up account: ' . $error->getMessage());
+            $this->api->respond_error('Could not create the Google account. Please try again.', 500);
+        }
+    }
+
+    private function startGoogleSignupVerification(array $user)
+    {
+        $existingRequest = $this->db->raw(
+            'SELECT
+                GREATEST(0, TIMESTAMPDIFF(SECOND, NOW(), expires_at)) AS expires_in_seconds,
+                GREATEST(0, ' . self::ONE_TIME_CODE_RESEND_DELAY_SECONDS . ' - TIMESTAMPDIFF(SECOND, sent_at, NOW())) AS resend_after_seconds
+             FROM email_verification_tokens WHERE user_id = ? LIMIT 1',
+            [$user['id']]
+        )->fetch(PDO::FETCH_ASSOC);
+        if ($existingRequest && (int) $existingRequest['resend_after_seconds'] > 0) {
+            return ['verification_email_sent' => true] + $this->codeTiming($existingRequest);
+        }
+
+        $code = str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+        if (!$this->db->transaction()) {
+            $this->api->respond_error('Could not request a verification code. Please try again.', 500);
+        }
+        try {
+            $this->db->raw(
+                'INSERT INTO email_verification_tokens (user_id, code_hash, expires_at, sent_at, attempts)
+                 VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 15 MINUTE), NOW(), 0)
+                 ON DUPLICATE KEY UPDATE code_hash = VALUES(code_hash), expires_at = VALUES(expires_at),
+                    sent_at = VALUES(sent_at), attempts = 0',
+                [$user['id'], $this->hashOneTimeCode($code)]
+            );
+            $this->db->commit();
+        } catch (Throwable $error) {
+            $this->db->roll_back();
+            error_log('Could not create Google sign-up verification code for user ' . $user['id'] . ': ' . $error->getMessage());
+            $this->api->respond_error('Could not request a verification code. Please try again.', 500);
+        }
+
+        $emailSent = false;
+        try {
+            SmtpMailer::sendEmailVerificationCode((string) $user['email'], (string) $user['name'], $code);
+            $emailSent = true;
+        } catch (Throwable $error) {
+            error_log('Could not send Google sign-up verification email for user ' . $user['id'] . ': ' . $error->getMessage());
+            try {
+                $this->db->raw('DELETE FROM email_verification_tokens WHERE user_id = ?', [$user['id']]);
+            } catch (Throwable $cleanupError) {
+                error_log('Could not remove unsent Google sign-up verification code for user ' . $user['id'] . ': ' . $cleanupError->getMessage());
+            }
+        }
+
+        return [
+            'verification_email_sent' => $emailSent,
+        ] + $this->codeTiming($emailSent ? null : [
+            'expires_in_seconds' => 0,
+            'resend_after_seconds' => 0,
+        ]);
     }
 
     private function verifyGoogleIdToken($idToken, $clientId)
