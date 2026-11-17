@@ -1,10 +1,12 @@
 <?php
 defined('PREVENT_DIRECT_ACCESS') OR exit('No direct script access allowed');
+require_once __DIR__ . '/../libraries/ReportAttachmentStorage.php';
 
 abstract class ApiBaseController extends Controller
 {
     protected $actor;
     protected $sessionId;
+    protected $reportAttachmentStorageInstance;
 
     public function __construct()
     {
@@ -125,6 +127,23 @@ abstract class ApiBaseController extends Controller
              FROM users WHERE id = ? LIMIT 1',
             [$id]
         )->fetch(PDO::FETCH_ASSOC);
+    }
+
+    protected function reportAttachmentStorage()
+    {
+        if ($this->reportAttachmentStorageInstance === null) {
+            $this->reportAttachmentStorageInstance = new ReportAttachmentStorage([
+                'app_env' => getenv('APP_ENV'),
+                'local_directory' => config_item('report_uploads_dir'),
+                'default_local_directory' => ROOT_DIR . 'runtime/uploads/reports',
+                'account_id' => config_item('r2_account_id'),
+                'bucket' => config_item('r2_bucket'),
+                'access_key_id' => config_item('r2_access_key_id'),
+                'secret_access_key' => config_item('r2_secret_access_key'),
+            ]);
+        }
+
+        return $this->reportAttachmentStorageInstance;
     }
 
     protected function withProfilePhotoUrl($user)

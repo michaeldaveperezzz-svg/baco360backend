@@ -124,6 +124,11 @@ $config['mail_from_name'] = getenv('MAIL_FROM_NAME') ?: 'Baco360';
 $config['gmail_api_client_id'] = getenv('GMAIL_API_CLIENT_ID') ?: '';
 $config['gmail_api_client_secret'] = getenv('GMAIL_API_CLIENT_SECRET') ?: '';
 $config['gmail_api_refresh_token'] = getenv('GMAIL_API_REFRESH_TOKEN') ?: '';
+$config['report_uploads_dir'] = getenv('REPORT_UPLOADS_DIR') ?: '';
+$config['r2_account_id'] = getenv('R2_ACCOUNT_ID') ?: '';
+$config['r2_bucket'] = getenv('R2_BUCKET') ?: '';
+$config['r2_access_key_id'] = getenv('R2_ACCESS_KEY_ID') ?: '';
+$config['r2_secret_access_key'] = getenv('R2_SECRET_ACCESS_KEY') ?: '';
 $frontend_url = getenv('FRONTEND_URL');
 if (!$frontend_url && (getenv('APP_ENV') ?: 'development') === 'development') {
 	$frontend_url = 'http://localhost:5173';

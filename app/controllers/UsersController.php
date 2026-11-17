@@ -338,8 +338,7 @@ class UsersController extends ApiBaseController
 
     private function deleteStoredReportAttachments(array $paths)
     {
-        $directory = realpath(ROOT_DIR . 'runtime/uploads/reports');
-        if ($directory === false) return true;
+        if (count($paths) === 0) return true;
 
         $allDeleted = true;
         foreach ($paths as $path) {
@@ -347,9 +346,12 @@ class UsersController extends ApiBaseController
                 $allDeleted = false;
                 continue;
             }
-            $filePath = realpath($directory . DIRECTORY_SEPARATOR . $path);
-            if ($filePath === false) continue;
-            if (dirname($filePath) !== $directory || !unlink($filePath)) {
+            try {
+                if (!$this->reportAttachmentStorage()->delete($path)) {
+                    $allDeleted = false;
+                }
+            } catch (RuntimeException $error) {
+                error_log('Report attachment cleanup failed: ' . $error->getMessage());
                 $allDeleted = false;
             }
         }

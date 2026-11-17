@@ -404,15 +404,13 @@ class ReportsController extends ApiBaseController
         );
         $commentId = (int) $this->db->raw('SELECT LAST_INSERT_ID()')->fetchColumn();
         if ($validatedPhoto) {
-            $storageDirectory = ROOT_DIR . 'runtime/uploads/reports/';
-            if (!is_dir($storageDirectory) && !mkdir($storageDirectory, 0750, true) && !is_dir($storageDirectory)) {
-                $this->api->respond_error('Photo storage is unavailable. Please contact support.', 500);
-            }
             $attachmentType = $report['status'] === 'resolved' ? 'resolution_evidence' : 'progress_photo';
             $fileName = bin2hex(random_bytes(16)) . '.' . self::IMAGE_TYPES[$validatedPhoto['mime_type']];
-            if (!move_uploaded_file($validatedPhoto['temporary_path'], $storageDirectory . $fileName)) {
-                $this->api->respond_error('The update photo could not be saved. Please try again.', 500);
-            }
+            $this->saveReportAttachment(
+                $validatedPhoto['temporary_path'],
+                $fileName,
+                $validatedPhoto['mime_type']
+            );
             $this->db->raw(
                 'INSERT INTO report_attachments (report_id, file_path, original_name, mime_type, file_size, attachment_type, created_at, updated_at)
                  VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())',
@@ -459,10 +457,6 @@ class ReportsController extends ApiBaseController
             $this->api->respond_error('A report can have up to 20 attachments.', 422);
         }
 
-        $storageDirectory = ROOT_DIR . 'runtime/uploads/reports/';
-        if (!is_dir($storageDirectory) && !mkdir($storageDirectory, 0750, true) && !is_dir($storageDirectory)) {
-            $this->api->respond_error('Attachment storage is unavailable. Please contact support.', 500);
-        }
         $fileInfo = new finfo(FILEINFO_MIME_TYPE);
         $savedAttachments = [];
         $validatedUploads = [];
@@ -508,10 +502,7 @@ class ReportsController extends ApiBaseController
             $extensions = self::IMAGE_TYPES + self::VIDEO_TYPES;
             $fileName = bin2hex(random_bytes(16)) . '.' . $extensions[$mimeType];
             $relativePath = $fileName;
-            $absolutePath = $storageDirectory . $fileName;
-            if (!move_uploaded_file($upload['temporary_path'], $absolutePath)) {
-                $this->api->respond_error('An image could not be saved. Please try again.', 500);
-            }
+            $this->saveReportAttachment($upload['temporary_path'], $fileName, $mimeType);
 
             $this->db->raw(
                 'INSERT INTO report_attachments (report_id, file_path, original_name, mime_type, file_size, attachment_type, created_at, updated_at)
@@ -559,21 +550,47 @@ class ReportsController extends ApiBaseController
         if (!$attachment || basename($attachment['file_path']) !== $attachment['file_path']) {
             $this->api->respond_error('Image not found.', 404);
         }
-
-        $filePath = ROOT_DIR . 'runtime/uploads/reports/' . $attachment['file_path'];
         $mimeType = $attachment['mime_type'];
-        if ((!isset(self::IMAGE_TYPES[$mimeType]) && !isset(self::VIDEO_TYPES[$mimeType])) || !is_file($filePath)) {
+        if (!isset(self::IMAGE_TYPES[$mimeType]) && !isset(self::VIDEO_TYPES[$mimeType])) {
             $this->api->respond_error('Attachment not found.', 404);
+        }
+
+        try {
+            $storedAttachment = $this->reportAttachmentStorage()->get($attachment['file_path']);
+        } catch (ReportAttachmentNotFoundException $error) {
+            $this->api->respond_error('Attachment not found.', 404);
+        } catch (RuntimeException $error) {
+            error_log('Report attachment download failed: ' . $error->getMessage());
+            $this->api->respond_error('Attachment storage is unavailable. Please try again.', 500);
         }
 
         while (ob_get_level() > 0) ob_end_clean();
         header('Content-Type: ' . $mimeType);
-        header('Content-Length: ' . filesize($filePath));
+        header('Content-Length: ' . $storedAttachment['content_length']);
         header('Content-Disposition: inline; filename="' . rawurlencode(basename($attachment['original_name'])) . '"');
         header('X-Content-Type-Options: nosniff');
         header('Cache-Control: private, no-store');
-        readfile($filePath);
+        $body = $storedAttachment['body'];
+        if (is_resource($body)) {
+            fpassthru($body);
+            fclose($body);
+        } else {
+            while (!$body->eof()) {
+                echo $body->read(8192);
+            }
+            $body->close();
+        }
         exit;
+    }
+
+    private function saveReportAttachment($temporaryPath, $fileName, $mimeType)
+    {
+        try {
+            $this->reportAttachmentStorage()->storeUploadedFile($temporaryPath, $fileName, $mimeType);
+        } catch (RuntimeException $error) {
+            error_log('Report attachment upload failed: ' . $error->getMessage());
+            $this->api->respond_error('Attachment storage is unavailable. Please try again.', 500);
+        }
     }
 
     public function assign($id)
