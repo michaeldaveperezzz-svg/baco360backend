@@ -1,6 +1,7 @@
 <?php
 defined('PREVENT_DIRECT_ACCESS') OR exit('No direct script access allowed');
 require_once __DIR__ . '/ApiBaseController.php';
+require_once __DIR__ . '/../libraries/GmailApiMailer.php';
 
 class ReportsController extends ApiBaseController
 {
@@ -88,6 +89,9 @@ class ReportsController extends ApiBaseController
             [$id, $actor['id'], 'submitted', 'Report submitted.']
         );
         $this->notifyRoles(['admin', 'staff'], $id, 'concern_submitted', $report['priority'], $actor['id']);
+        if ($actor['role'] === 'resident') {
+            $this->emailAdminsNewReport($id, $reference, $report, $category['name'], $actor['name']);
+        }
         $this->audit('created', 'reports', $id, 'Submitted report ' . $reference);
         $row = $this->findReport($id);
         $this->respondSuccess([
@@ -95,6 +99,74 @@ class ReportsController extends ApiBaseController
             'reference_number' => $reference,
             'report' => $this->reportDetails($row),
         ], 'Report submitted.', 201);
+    }
+
+    private function emailAdminsNewReport($reportId, $reference, array $report, $categoryName, $residentName)
+    {
+        if (!GmailApiMailer::isConfigured()) {
+            error_log('Report ' . $reportId . ' was submitted, but Gmail API email is not configured.');
+            return;
+        }
+
+        try {
+            $admins = $this->db->raw(
+                'SELECT u.id, u.name, u.email
+                 FROM users u
+                 LEFT JOIN notification_settings ns ON ns.user_id = u.id
+                 WHERE u.role = ? AND u.is_active = 1 AND u.email_verified_at IS NOT NULL
+                   AND u.email <> \'\'
+                   AND COALESCE(ns.email_enabled, 1) = 1
+                   AND COALESCE(ns.report_updates_enabled, 1) = 1
+                 ORDER BY u.id',
+                ['admin']
+            )->fetchAll(PDO::FETCH_ASSOC);
+        } catch (Throwable $error) {
+            error_log('Could not find email recipients for report ' . $reportId . ': ' . $error->getMessage());
+            return;
+        }
+        if (!$admins) {
+            error_log('Report ' . $reportId . ' was submitted, but no email-enabled verified admins were found.');
+            return;
+        }
+
+        foreach ($admins as $admin) {
+            $safeName = htmlspecialchars((string) $admin['name'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            $safeResidentName = htmlspecialchars((string) $residentName, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            $safeReference = htmlspecialchars((string) $reference, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            $safeTitle = htmlspecialchars((string) $report['title'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            $safeCategory = htmlspecialchars((string) $categoryName, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+            $safePriority = htmlspecialchars((string) $report['priority'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+
+            $text = "Hello {$admin['name']},\n\nA resident submitted a new issue report.\n\n"
+                . "Reference: {$reference}\n"
+                . "Reported by: {$residentName}\n"
+                . "Issue: {$report['title']}\n"
+                . "Category: {$categoryName}\n"
+                . "Priority: {$report['priority']}\n\n"
+                . 'Please sign in to Baco360 to review and assign this report.';
+            $html = '<p>Hello ' . $safeName . ',</p>'
+                . '<p>A resident submitted a new issue report.</p>'
+                . '<ul><li><strong>Reference:</strong> ' . $safeReference . '</li>'
+                . '<li><strong>Reported by:</strong> ' . $safeResidentName . '</li>'
+                . '<li><strong>Issue:</strong> ' . $safeTitle . '</li>'
+                . '<li><strong>Category:</strong> ' . $safeCategory . '</li>'
+                . '<li><strong>Priority:</strong> ' . $safePriority . '</li></ul>'
+                . '<p>Please sign in to Baco360 to review and assign this report.</p>';
+
+            try {
+                GmailApiMailer::sendEmail(
+                    $admin['email'],
+                    'New resident report: ' . $reference,
+                    $text,
+                    $html
+                );
+            } catch (Throwable $error) {
+                error_log(
+                    'Could not send report ' . $reportId . ' email to admin '
+                    . $admin['id'] . ': ' . $error->getMessage()
+                );
+            }
+        }
     }
 
     public function update($id)
