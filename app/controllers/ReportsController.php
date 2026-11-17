@@ -493,7 +493,12 @@ class ReportsController extends ApiBaseController
         $staffId = filter_var($input['staff_id'] ?? null, FILTER_VALIDATE_INT);
         if (!$staffId) $this->api->respond_error('A valid staff member is required.', 422);
         $staff = $this->db->raw(
-            'SELECT id, name FROM users WHERE id = ? AND role = ? AND is_active = 1 LIMIT 1',
+            'SELECT u.id, u.name, u.email, u.email_verified_at,
+                    COALESCE(ns.email_enabled, 1) AS email_enabled,
+                    COALESCE(ns.report_updates_enabled, 1) AS report_updates_enabled
+             FROM users u
+             LEFT JOIN notification_settings ns ON ns.user_id = u.id
+             WHERE u.id = ? AND u.role = ? AND u.is_active = 1 LIMIT 1',
             [$staffId, 'staff']
         )->fetch(PDO::FETCH_ASSOC);
         if (!$staff) $this->api->respond_error('The selected staff account is not active.', 422);
@@ -518,8 +523,70 @@ class ReportsController extends ApiBaseController
                 [$id, $actor['id'], $report['status'], 'assigned', 'Assigned to staff.']
             );
         }
+        $this->emailAssignedReportToStaff($id, $report, $staff);
         $this->audit('assigned', 'reports', $id, 'Assigned report to staff member ' . $staffId);
         $this->respondSuccess($this->reportDetails($this->findReport($id)), 'Report assigned.');
+    }
+
+    private function emailAssignedReportToStaff($reportId, array $report, array $staff)
+    {
+        if (empty($staff['email_verified_at'])
+            || (int) $staff['email_enabled'] !== 1
+            || (int) $staff['report_updates_enabled'] !== 1) {
+            return;
+        }
+        if (!GmailApiMailer::isConfigured()) {
+            error_log('Report ' . $reportId . ' was assigned, but Gmail API email is not configured.');
+            return;
+        }
+
+        $assignedAt = date('F j, Y g:i A');
+        $frontendUrl = rtrim((string) config_item('frontend_url'), '/');
+        $reportUrl = $frontendUrl !== ''
+            ? $frontendUrl . '/?report=' . rawurlencode((string) $reportId)
+            : null;
+        if ($reportUrl === null) {
+            error_log('Report ' . $reportId . ' was assigned, but FRONTEND_URL is not configured.');
+        }
+
+        $reference = (string) $report['reference_number'];
+        $title = (string) $report['title'];
+        $location = (string) ($report['location_address'] ?? '');
+        $text = "Report assigned\n\nHello {$staff['name']},\n\nA report has been assigned to you.\n\n"
+            . "Reference: {$reference}\n"
+            . "Title: {$title}\n"
+            . "Location: {$location}\n"
+            . "Assigned: {$assignedAt}\n\n"
+            . ($reportUrl !== null ? 'Open report in Baco360: ' . $reportUrl : 'Sign in to Baco360 to open the report.');
+        $safeName = htmlspecialchars((string) $staff['name'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safeReference = htmlspecialchars($reference, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safeTitle = htmlspecialchars($title, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safeLocation = htmlspecialchars($location, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $safeAssignedAt = htmlspecialchars($assignedAt, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+        $html = '<h2>Report assigned</h2>'
+            . '<p>Hello ' . $safeName . ',</p>'
+            . '<p>A report has been assigned to you.</p>'
+            . '<p><strong>Reference:</strong> ' . $safeReference . '<br>'
+            . '<strong>Title:</strong> ' . $safeTitle . '<br>'
+            . '<strong>Location:</strong> ' . $safeLocation . '<br>'
+            . '<strong>Assigned:</strong> ' . $safeAssignedAt . '</p>'
+            . ($reportUrl !== null
+                ? '<p><a href="' . htmlspecialchars($reportUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">Open report in Baco360</a></p>'
+                : '<p>Sign in to Baco360 to open the report.</p>');
+
+        try {
+            GmailApiMailer::sendEmail(
+                $staff['email'],
+                'Report assigned to you: ' . $reference,
+                $text,
+                $html
+            );
+        } catch (Throwable $error) {
+            error_log(
+                'Could not send report ' . $reportId . ' assignment email to staff '
+                . $staff['id'] . ': ' . $error->getMessage()
+            );
+        }
     }
 
     private function validateReportFields($input, $required)
